@@ -331,14 +331,15 @@ def replace_qwen2_vl_attention_class():
         return_mask
     )
 
-
+# 这几个函数有self是因为将会佳节在transformer中已经存在的类上，该设计模式叫做猴子补丁(Monkey Patching)
+# 打印所有视觉模块的训练状态（可否训练），包括attention block和merger module
 def print_trainable_parameters_visual(self) -> None:
     """
     Prints the trainable status of all vision components including attention blocks and merger module.
     Outputs the indices of trainable/non-trainable blocks and the merger module status.
     """
-    trainable_blocks = []
-    non_trainable_blocks = []
+    trainable_blocks = []  # 可训练
+    non_trainable_blocks = []  # 不可训练
 
     # Check trainable status of vision attention blocks
     for block_idx, block in enumerate(self.blocks):
@@ -348,7 +349,7 @@ def print_trainable_parameters_visual(self) -> None:
         else:
             non_trainable_blocks.append(block_idx)
 
-    # Check trainable status of merger module
+    # Check trainable status of merger module 融合层的训练状态
     is_merger_trainable = any(param.requires_grad for param in self.merger.parameters())
 
     # Print results
@@ -361,7 +362,7 @@ def print_trainable_parameters_visual(self) -> None:
     )
     print(f"Merger Module Trainable: {is_merger_trainable}")
 
-
+# 打印LLM的训练状态（可否训练），包括embeddings, layers, and normalization
 def print_trainable_parameters(self) -> None:
     """
     Prints the trainable status of all LLM components including embeddings, layers, and normalization.
@@ -397,6 +398,7 @@ def create_optimizer(self):
 
     opt_model = self.model
 
+    # 创建优化器
     if self.optimizer is None:
         decay_parameters = self.get_decay_parameter_names(opt_model)
         decay_parameters = [name for name in decay_parameters if "bias" not in name]
@@ -571,7 +573,7 @@ def create_optimizer(self):
     return self.optimizer
 
 
-# Apply monkey patches
+# Apply monkey patches（新增函数/方法）
 Trainer.create_optimizer = create_optimizer
 
 Qwen2VisionTransformerPretrainedModel.print_trainable_parameters = (

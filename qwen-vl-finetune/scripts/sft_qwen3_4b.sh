@@ -26,7 +26,7 @@ datasets=public_dataset1,public_dataset2
 run_name="qwen3vl"
 output_dir=./output
 
-# Training arguments
+# Training arguments（model args）
 args="
     --deepspeed ${deepspeed} \
     --model_name_or_path "${llm}" \
