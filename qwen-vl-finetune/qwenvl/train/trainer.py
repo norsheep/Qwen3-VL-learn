@@ -29,7 +29,7 @@ from transformers.utils import logging
 
 logger = logging.get_logger(__name__)
 
-
+# 注意力前向传播函数，而非block，不包含attention以外的其他前向计算
 def flash_attention_forward(
     module: torch.nn.Module,
     query: torch.Tensor,
@@ -42,6 +42,8 @@ def flash_attention_forward(
     softcap: Optional[float] = None,
     **kwargs,
 ) -> tuple[torch.Tensor, None]:
+
+    # flash_attention_2不能输出 attention weight，也不支持head_mask
     if kwargs.get("output_attentions", False) or kwargs.get("head_mask") is not None:
         logger.warning_once(
             "`flash_attention_2` does not support `output_attentions=True` or `head_mask`."
@@ -92,6 +94,12 @@ def flash_attention_forward(
             ]
         ).item()
 
+    # 使用flash_attention_2计算注意力。
+    # attention output是是与输入hidden_states形状相同的张量，是根据注意力得分对value张量进行加权求和的结果。
+    # 这个输出用于传递给模型下一层，是前向传播的中间值
+    # attention weight是一个形状为[batch_size, num_heads, query_len, query_len]的张量，是注意力得分（权重）矩阵，表达计算中每个token对其他所有token的关注程度，和使用与可视化分析和可解释性的分析，对于模型前向传播没什么作用
+    # 具体而言，attention weight就是计算QK/sqrt(dk)再归一化的结果(dk是一个缩放值，也可以是head_dim)，也就是每个token对其他所有token的注意力分布。
+    # attention output是将attention weight与V张量相乘的结果。本质是加权求和，用改词对每个词的关注度乘以这个词的内容(value)，把他们全部加起来，得到一个新的向量，这个向量值融合了整个序列中所有与改词相关的信息。
     attn_output = flash_attn_varlen_func(
         query,
         key,
@@ -106,6 +114,53 @@ def flash_attention_forward(
     attn_output = attn_output.unsqueeze(0)
 
     return attn_output, None
+
+# 未解决上述无法输出attention weight的问题，这里新写了一个函数，代价是速度会很慢
+import math
+def eager_attention_forward(
+    module: torch.nn.Module,
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    attention_mask: Optional[torch.Tensor] = None,
+    dropout: float = 0.0,
+    **kwargs,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Standard (eager) attention implementation that returns attention weights.
+    """
+    bsz, num_heads, q_len, head_dim = query.shape
+    
+    # 1. Calculate scores (Q @ K.T)
+    attn_weights = torch.matmul(query, key.transpose(2, 3)) / math.sqrt(head_dim)
+
+    # 2. Apply attention mask
+    # The original `attention_mask` is cu_seqlens, which is not suitable for eager attention.
+    # We must construct a proper causal mask for this implementation.
+    if attention_mask is None:
+        # Build a causal mask
+        mask = torch.full((q_len, q_len), torch.finfo(attn_weights.dtype).min, device=attn_weights.device)
+        mask_cond = torch.arange(mask.size(-1), device=attn_weights.device)
+        mask.masked_fill_(mask_cond < (mask_cond + 1).view(mask.size(-1), 1), 0)
+        mask = mask.to(attn_weights.dtype)
+        attention_mask = mask.unsqueeze(0).unsqueeze(0).expand(bsz, num_heads, -1, -1)
+
+    attn_weights = attn_weights + attention_mask
+
+    # 3. Softmax to get probabilities
+    attn_weights = torch.nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query.dtype)
+    
+    # 4. Apply dropout
+    if dropout > 0.0:
+        attn_weights = torch.nn.functional.dropout(attn_weights, p=dropout)
+
+    # 5. Calculate output (weights @ V)
+    attn_output = torch.matmul(attn_weights, value)
+
+    attn_output = attn_output.transpose(1, 2).contiguous()
+    attn_output = attn_output.reshape(bsz, q_len, -1)
+
+    return attn_output, attn_weights
 
 
 @deprecate_kwarg("past_key_value", new_name="past_key_values", version="4.58")
@@ -140,6 +195,7 @@ def qwen2vl_forward(
         cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}  # Specific to RoPE models
         key_states, value_states = past_key_values.update(key_states, value_states, self.layer_idx, cache_kwargs)
 
+    # 两处代码在这里都显示，应该是能够输出attention的，但是该函数内部却会warning
     attn_output, attn_weights = flash_attention_forward(
         self,
         query_states,
@@ -152,6 +208,17 @@ def qwen2vl_forward(
         position_ids=position_ids,  # pass positions for FA2
         **kwargs,
     )
+
+    # 如果用eager_attention_forward，则可以输出attention weight
+    if kwargs.get("output_attentions", False):
+        attn_output, attn_weights = eager_attention_forward(
+            self,
+            query_states,
+            key_states,
+            value_states,
+            attention_mask,
+            dropout=0.0 if not self.training else self.attention_dropout,
+        )
 
     attn_output = attn_output.reshape(bsz, q_len, -1).contiguous()
     attn_output = self.o_proj(attn_output)
@@ -195,6 +262,17 @@ def qwen3vl_forward(
         **kwargs,
     )
 
+    # 如果用eager_attention_forward，则可以输出attention weight
+    if kwargs.get("output_attentions", False):
+        attn_output, attn_weights = eager_attention_forward(
+            self,
+            query_states,
+            key_states,
+            value_states,
+            attention_mask,
+            dropout=0.0 if not self.training else self.attention_dropout,
+        )
+
     attn_output = attn_output.reshape(*input_shape, -1).contiguous()
     attn_output = self.o_proj(attn_output)
     return attn_output, attn_weights
@@ -213,10 +291,11 @@ def return_mask(
 
 
 def replace_qwen2_vl_attention_class():
+    # 替换Qwen2VL、Qwen2.5VL和Qwen3VL的注意力机制。
     import transformers
     import transformers.modeling_flash_attention_utils
 
-
+    # Qwen2VL的注意力机制。
     transformers.models.qwen2_vl.modeling_qwen2_vl.Qwen2VLAttention.forward = (
         qwen2vl_forward
     )
@@ -226,7 +305,8 @@ def replace_qwen2_vl_attention_class():
     transformers.models.qwen2_vl.modeling_qwen2_vl.create_sliding_window_causal_mask = (
         return_mask
     )    
-    ## qwen2_5_vl
+    # Qwen2.5VL的注意力机制。
+    # 2.5用的是和qwen2vl一样的forward
     transformers.models.qwen2_5_vl.modeling_qwen2_5_vl.Qwen2_5_VLAttention.forward = (
         qwen2vl_forward
     )
@@ -236,14 +316,14 @@ def replace_qwen2_vl_attention_class():
     transformers.models.qwen2_5_vl.modeling_qwen2_5_vl.create_sliding_window_causal_mask = (
         return_mask
     )
-    ## qwen3vl
+    # Qwen3VL的注意力机制。
     transformers.models.qwen3_vl.modeling_qwen3_vl.Qwen3VLTextAttention.forward = (
         qwen3vl_forward
     )
     transformers.models.qwen3_vl.modeling_qwen3_vl.create_causal_mask = (
         return_mask
     )
-    ## qwen3vl moe
+    # Qwen3VL MoE的注意力机制。
     transformers.models.qwen3_vl_moe.modeling_qwen3_vl_moe.Qwen3VLMoeTextAttention.forward = (
         qwen3vl_forward
     )
