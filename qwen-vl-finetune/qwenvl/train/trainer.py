@@ -98,8 +98,8 @@ def flash_attention_forward(
     # attention output是是与输入hidden_states形状相同的张量，是根据注意力得分对value张量进行加权求和的结果。
     # 这个输出用于传递给模型下一层，是前向传播的中间值
     # attention weight是一个形状为[batch_size, num_heads, query_len, query_len]的张量，是注意力得分（权重）矩阵，表达计算中每个token对其他所有token的关注程度，和使用与可视化分析和可解释性的分析，对于模型前向传播没什么作用
-    # 具体而言，attention weight就是计算QK/sqrt(dk)再归一化的结果(dk是一个缩放值，也可以是head_dim)，也就是每个token对其他所有token的注意力分布。
-    # attention output是将attention weight与V张量相乘的结果。本质是加权求和，用改词对每个词的关注度乘以这个词的内容(value)，把他们全部加起来，得到一个新的向量，这个向量值融合了整个序列中所有与改词相关的信息。
+    # 具体而言，attention weight就是计算 QK/sqrt(dk) 再归一化的结果(dk是一个缩放值，也可以是head_dim)，也就是每个token对其他所有token的注意力分布。
+    # attention output是将attention weight与V张量相乘的结果 QK/sqrt(dk) * V。本质是加权求和，用改词对每个词的关注度乘以这个词的内容(value)，把他们全部加起来，得到一个新的向量，这个向量值融合了整个序列中所有与改词相关的信息。
     attn_output = flash_attn_varlen_func(
         query,
         key,
